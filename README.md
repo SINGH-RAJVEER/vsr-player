@@ -100,6 +100,7 @@ be billed ×2/×3/×4.
 </p>
 
 ## Quick start
+For NixOS and NixBox, see the [flake installation guide](docs/nixos.md).
 
 **Source build** (recommended — the binaries match your system libraries by construction):
 
