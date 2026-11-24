@@ -17,6 +17,10 @@
 #include <QDir>
 #include <QSet>
 #include <QSaveFile>
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QLocale>
@@ -172,9 +176,13 @@ void PlayerViewModel::attach(MpvController *mpv) {
         });
     });
 
+    // volume：**UI 直接 observe mpv 的值**（唯一写入者）。
+    // 用户操作只下发命令（见 setVolume），不预写 volume_——"乐观更新 + 异步
+    // 回写"会让两个来源抢同一个变量：按住方向键时回写落后于用户操作，OSD
+    // 百分比就会往回跳（2026-11-24 实测 5 秒内 31 次倒退）。
     mpv_->observeProperty("volume", MPV_FORMAT_DOUBLE, [this, post] {
-        double v = mpv_->propertyDouble("volume") / 100.0;
-        post([this, v] { updateVolume(v); });
+        const double v = mpv_->propertyDouble("volume") / 100.0;
+        post([this, v] { applyObservedVolume(v); });
     });
 
     // 无 mute 状态位：volume 观察回写即推导静音（volume==0）——
@@ -322,6 +330,7 @@ void PlayerViewModel::attach(MpvController *mpv) {
     mpv_->observeProperty("playlist", MPV_FORMAT_NODE, [this, post] {
         QStringList files;
         QStringList titles;
+        QVector<qint64> ids;
         int cur = -1;
         mpv_node node;
         if (mpv_get_property(mpv_->handle(), "playlist", MPV_FORMAT_NODE,
@@ -332,6 +341,7 @@ void PlayerViewModel::attach(MpvController *mpv) {
                     if (entry->format != MPV_FORMAT_NODE_MAP)
                         continue;
                     QString fn, ti;
+                    int64_t eid = 0;
                     for (int j = 0; j < entry->u.list->num; j++) {
                         const char *k = entry->u.list->keys[j];
                         mpv_node *v = &entry->u.list->values[j];
@@ -339,10 +349,13 @@ void PlayerViewModel::attach(MpvController *mpv) {
                             fn = v->u.string;
                         else if (!strcmp(k, "title") && v->format == MPV_FORMAT_STRING)
                             ti = v->u.string;
+                        else if (!strcmp(k, "id") && v->format == MPV_FORMAT_INT64)
+                            eid = v->u.int64;
                         else if (!strcmp(k, "current") && v->format == MPV_FORMAT_FLAG
                                  && v->u.flag)
                             cur = i;
                     }
+                    ids.append(eid);
                     files.append(fn);
                     titles.append(ti);
                 }
@@ -352,7 +365,7 @@ void PlayerViewModel::attach(MpvController *mpv) {
         // 全量快照 → PlaylistModel 前缀 diff 增量生效（切歌只刷
         // current 行高亮，不重建列表——QStringList 属性全量 reset
         // 是大列表卡顿主因）
-        post([this, files, titles, cur] {
+        post([this, files, titles, ids, cur] {
             // 缓存的 current 索引（= mpv playlist-pos，-1 = 无当前条目）。
             // "移除当前条目"用它，避免在 GUI 线程同步读 playlist-pos
             //（同 path 观察器注释：同步 mpv API 会和 DR 帧分配互锁）。
@@ -383,7 +396,19 @@ void PlayerViewModel::attach(MpvController *mpv) {
             int shown = cur;
             if (shown < 0 && idlePlayIndex_ >= 0 && idlePlayIndex_ < files.size())
                 shown = idlePlayIndex_;
-            playlistModel_.setSnapshot(files, shown, titles);
+            // entry id → 路径（end-file 只给 id；文案要判断"是不是目录"）
+            entryPathById_.clear();
+            for (int i = 0; i < ids.size() && i < files.size(); i++)
+                entryPathById_.insert(ids[i], files[i]);
+            // 失败标记按路径保存；列表里已消失的路径一并丢弃（不残留）
+            for (auto it = entryErrors_.begin(); it != entryErrors_.end(); ) {
+                if (!files.contains(it.key())) it = entryErrors_.erase(it);
+                else ++it;
+            }
+            QVector<int> errs(files.size(), 0);
+            for (int i = 0; i < files.size(); i++)
+                errs[i] = entryErrors_.value(files[i], 0);
+            playlistModel_.setSnapshot(files, shown, titles, errs);
             // 持久化上次播放列表：写**m3u8 快照**（带 #EXTINF 标题），恢复时
             // 交给 mpv 的 `loadlist` —— 条目名由 demux_playlist 解析出来，
             // 客户端不再自己维护"路径→名字"表（蓝光 title 因此天然保留）。
@@ -913,6 +938,21 @@ void PlayerViewModel::saveSettings(const char *key, const QVariant &value) {
 
 void PlayerViewModel::loadSettings() {
     settingsEnabled_ = true;
+    // 一次性迁移/清理：旧版本把播放列表（~300 KB）和轨道记忆（~1.2 MB）存在
+    // 主配置 INI 里，任何一次配置写入都要重写整个 1.5 MB 文件（实测 19 ms，
+    // GUI/渲染线程 → 卡顿）。轨道记忆在 loadTrackMemory() 里迁到独立 JSON；
+    // 播放列表先写成 m3u8 快照再用，旧键随后删除。
+    if (settings_.contains("playlist")) {
+        const QStringList legacy = settings_.value("playlist").toStringList();
+        const int legacyCur = settings_.value("playlistCurrent", -1).toInt();
+        if (!legacy.isEmpty() && !QFileInfo::exists(playlistSnapshotPath()))
+            writePlaylistSnapshot(legacy, {}, legacyCur);
+        settings_.remove("playlist");
+        settings_.remove("playlistCurrent");
+        settings_.sync();
+        MLOG_INFO("legacy playlist key migrated (%zu entries)", (size_t)legacy.size());
+    }
+    loadTrackMemory();
     persistScale_ = settings_.value("scale", 0.0).toDouble();
     if (persistScale_ < -1.0 || persistScale_ > 4.0 || persistScale_ == 1.0)
         persistScale_ = 0.0;   // 非法值（手改配置）→ auto
@@ -1289,12 +1329,14 @@ void PlayerViewModel::togglePlayPause() {
 }
 
 void PlayerViewModel::setFileLoaded(bool v) {
+    // 载入成功 = 进入 playing。必须放在**去重之前**：切歌时 fileLoaded_ 一直是
+    // true，去重会提前 return，于是上一条失败留下的 phase=3 永远清不掉
+    //（"无法播放"卡片不消失的根因）。
+    if (v && mediaPhase_ != 2)
+        setMediaPhase(2);
     if (fileLoaded_ == v) return;
     fileLoaded_ = v;
     emit hasMediaChanged();
-    // 载入成功 = 进入 playing（失败态由 END_FILE(ERROR) 写成 3，别在这里覆盖）
-    if (v && mediaPhase_ != 2)
-        setMediaPhase(2);
 }
 
 void PlayerViewModel::stop() {
@@ -1375,7 +1417,7 @@ void PlayerViewModel::notePlaybackRestart() {
 // ── Audio（乐观更新）────────────────────────────────────────────────
 
 void PlayerViewModel::nudgeVolume(double delta) {
-    setVolume(volume_ + delta);
+    setVolume(requestedVolume_ + delta);
     emit volumeNudged();
 }
 
@@ -1383,10 +1425,11 @@ void PlayerViewModel::setVolume(double vol) {
     if (!mpv_) return;
     if (vol < 0.0) vol = 0.0;
     if (vol > 1.0) vol = 1.0;
-    // 乐观更新：QML 立即反馈，mpv volume 观察事件随后回写校正。
-    // 静音为派生状态（volume==0），无需额外状态迁移。
-    if (volume_ != vol) { volume_ = vol; emit volumeChanged(); }
-    saveSettings("volume", vol);
+    // 只记目标 + 下发；**不改 volume_**（显示值由观察器写，见 applyObservedVolume）。
+    requestedVolume_ = vol;
+    // 不在这里写 QSettings：滑杆 live 拖动时每移动一次都会触发一次
+    // QSettings 全文件重写（实测 19 ms 均值 / 88 ms 峰值，GUI 线程 = 渲染
+    // 线程 → 视频卡顿）。落盘改到交互结束（见 persistVolume 调用点）。
     // 转发 + 节流：slider 拖动高频调用只记录最新值，事件循环每迭代
     // 合并投递一次（async，主线程零阻塞——避免同步 set 与 flip_page
     // 的 core-lock 互锁窗口，见 PlayerViewModel 线程模型注释）。
@@ -1402,14 +1445,32 @@ void PlayerViewModel::setVolume(double vol) {
 
 // 静音 = 音量 0：进入静音记录当前音量（过小则记可听下限），退出恢复。
 // 全程只操作 volume 属性（mpv `mute` 属性不使用），乐观更新走 setVolume。
+void PlayerViewModel::applyObservedVolume(double v) {
+    // mpv 的音量（唯一事实源）→ UI。观察器是 volume_ 的**唯一写入者**。
+    if (volume_ != v) {
+        volume_ = v;
+        emit volumeChanged();
+    }
+}
+
+void PlayerViewModel::persistVolume() {
+    // 保存"用户意图"（requestedVolume_）：观察值可能还落后最后一次写入。
+    // 圆到 4 位小数，避免 0.05 累加出来的 0.7499999999999998 落盘。
+    saveSettings("volume", qRound(requestedVolume_ * 10000.0) / 10000.0);
+}
+
 void PlayerViewModel::toggleMute() {
     if (!mpv_) return;
-    if (muted()) {
+    // 判定用"下发目标"：观察值可能还停在上一档（异步），按它判断会连点两次
+    // 都执行同一个方向。
+    if (requestedVolume_ == 0.0) {
         setVolume(savedVolume_);
+        persistVolume();
     } else {
         // 音量过小（如 slider 拖到 0 附近）→ 记录可听下限，退出静音后可听
-        savedVolume_ = std::max(volume_, kMinUnmuteVolume);
+        savedVolume_ = std::max(requestedVolume_, kMinUnmuteVolume);
         setVolume(0.0);
+        persistVolume();
     }
 }
 
@@ -1891,6 +1952,10 @@ void PlayerViewModel::openFiles(const QStringList &pathsIn, int mode) {
     if (!mpv_ || pathsIn.isEmpty()) return;
     QStringList paths;
     for (const QString &p : pathsIn) paths.append(toLocalPath(p));
+    // 重新打开这些路径 = 重新尝试；此前的失败标记随之作废（mpv 会重新探测）。
+    bool cleared = false;
+    for (const QString &p : paths) cleared |= entryErrors_.remove(p);
+    if (cleared) refreshPlaylistErrors();
     if (mode == 2) {   // 加载字幕
         for (const QString &p : paths) {
             mpv_->commandAsync({"sub-add", p.toUtf8().constData(), "select", nullptr});
@@ -2217,6 +2282,91 @@ void PlayerViewModel::scanSubtitleFiles(const QString &videoPath) {
 // 恢复：文件加载完成 hook（FILE_LOADED——打开文件与播放列表选取同
 // 路径），仅当该路径有记忆时生效（再次打开对应文件才恢复；含 CLI
 // 显式文件）。外部字幕恢复 = sub-add（exists 对照 trackList 防重复轨）。
+// 只持久化"重新可添加"的字幕来源：本地文件，或 http(s) URL。
+// mpv/ytdl_hook 会为在线视频生成 edl:///memory:// 之类的临时 URL，subs 里
+// 存的是**整段字幕内容**（实测一条 bilibili 记录 281 KB），既无法在下次
+// 打开时复用，又把轨道记忆文件撑到几百 KB。
+static bool isPersistableSubPath(const QString &p) {
+    if (p.isEmpty()) return false;
+    if (!p.contains(QStringLiteral("://"))) return true;
+    return p.startsWith(QStringLiteral("http://")) ||
+           p.startsWith(QStringLiteral("https://"));
+}
+
+// ── 轨道记忆存储（独立 JSON 文件）──────────────────────────────────
+// 以前是 QSettings 的两个键（trackMem 1.2 MB）+ 每次动作 sync()：任何一次
+// 配置写入都要重写整个 1.5 MB 的 INI（实测 mean 19 ms / max 88 ms），而
+// GUI 线程同时是渲染线程 → 拖动滑杆/换轨时画面卡顿。改为独立小文件：
+// 读取一次进内存，写入用 QSaveFile 原子替换，不触碰 app 配置。
+QString PlayerViewModel::trackMemoryPath() const {
+    const QString dir = QFileInfo(settings_.fileName()).absolutePath();
+    return dir + QStringLiteral("/track-memory.json");
+}
+
+void PlayerViewModel::loadTrackMemory() {
+    if (trackMemLoaded_) return;
+    trackMemLoaded_ = true;
+    bool loaded = false;
+    QFile f(trackMemoryPath());
+    if (f.open(QIODevice::ReadOnly)) {
+        const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+        for (const QString &k : o.value("order").toVariant().toStringList())
+            trackMemOrder_ << k;
+        const QJsonObject entries = o.value("entries").toObject();
+        for (auto it = entries.begin(); it != entries.end(); ++it)
+            trackMem_.insert(it.key(), it.value().toObject().toVariantMap());
+        loaded = true;
+    }
+    // 一次性迁移：旧版本存在 QSettings 里的大键（1.2 MB）→ 独立 JSON
+    if (!loaded && settings_.contains("trackMem")) {
+        trackMem_ = settings_.value("trackMem").toMap();
+        trackMemOrder_ = settings_.value("trackMemOrder").toStringList();
+        settings_.remove("trackMem");
+        settings_.remove("trackMemOrder");
+        settings_.sync();
+        loaded = true;
+        MLOG_INFO("track memory migrated to %s", qUtf8Printable(trackMemoryPath()));
+    }
+    // 清理：丢掉无法复用的临时字幕来源（edl:// / memory:// …）——旧版本把
+    // 整段字幕内容当路径存过，单条记录曾达 281 KB。清理有变化才写回。
+    bool sanitized = false;
+    for (auto it = trackMem_.begin(); it != trackMem_.end(); ++it) {
+        QVariantMap m = it.value().toMap();
+        const QStringList before = m.value("subs").toStringList();
+        QStringList subs;
+        for (const QString &p : before)
+            if (isPersistableSubPath(p)) subs << p;
+        if (subs.isEmpty()) {
+            m.remove("subs");
+            m.remove("sel");
+        } else {
+            m["subs"] = subs;
+            if (!subs.contains(m.value("sel").toString())) m.remove("sel");
+        }
+        if (m.value("subs").toStringList() != before) sanitized = true;
+        it.value() = m;
+    }
+    if (loaded && sanitized) writeTrackMemory();
+}
+
+void PlayerViewModel::writeTrackMemory() {
+    QJsonObject entries;
+    for (auto it = trackMem_.begin(); it != trackMem_.end(); ++it)
+        entries.insert(it.key(), QJsonObject::fromVariantMap(it.value().toMap()));
+    QJsonObject root;
+    root.insert("version", 1);
+    root.insert("order", QJsonArray::fromStringList(trackMemOrder_));
+    root.insert("entries", entries);
+    QSaveFile f(trackMemoryPath());
+    if (!f.open(QIODevice::WriteOnly)) {
+        MLOG_WARN("track memory: cannot write %s", qUtf8Printable(trackMemoryPath()));
+        return;
+    }
+    f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+    if (!f.commit())
+        MLOG_WARN("track memory: commit failed for %s", qUtf8Printable(trackMemoryPath()));
+}
+
 void PlayerViewModel::saveTrackMemory() {
     if (!settingsEnabled_ || lastPath_.isEmpty()) return;
     QVariantMap mem;
@@ -2231,7 +2381,7 @@ void PlayerViewModel::saveTrackMemory() {
         }
         if (type == "sub" && m["external"].toBool()) {
             const QString f = m["filename"].toString();
-            if (!f.isEmpty()) {
+            if (isPersistableSubPath(f)) {
                 QStringList subs = mem["subs"].toStringList();
                 subs.append(f);
                 mem["subs"] = subs;
@@ -2243,6 +2393,7 @@ void PlayerViewModel::saveTrackMemory() {
     // 并入 subs 保证即时落盘完整；trackList_ 回写后自然合并。
     // 最近一次 sub-add select 的路径即为选中（trackList_ 尚未反映）。
     for (const QString &p : pendingSubs_) {
+        if (!isPersistableSubPath(p)) continue;
         QStringList subs = mem["subs"].toStringList();
         if (!subs.contains(p)) {
             subs.append(p);
@@ -2256,8 +2407,9 @@ void PlayerViewModel::saveTrackMemory() {
     mem["audioDelay"] = audioDelay_;
     // LRU：trackMem 按 path 键存内容；trackMemOrder 记录访问序
     //（头部 = 最近使用）。超上限（10）淘汰最久未用。
-    QVariantMap all = settings_.value("trackMem").toMap();
-    QStringList order = settings_.value("trackMemOrder").toStringList();
+    loadTrackMemory();
+    QVariantMap all = trackMem_;
+    QStringList order = trackMemOrder_;
     all[lastPath_] = mem;
     order.removeAll(lastPath_);
     order.prepend(lastPath_);
@@ -2270,25 +2422,25 @@ void PlayerViewModel::saveTrackMemory() {
         if (!order.contains(it.key())) it = all.erase(it);
         else ++it;
     }
-    settings_.setValue("trackMem", all);
-    settings_.setValue("trackMemOrder", order);
-    settings_.sync();   // 即时落盘（QSettings 默认内存缓冲，须显式刷盘）
+    trackMem_ = all;
+    trackMemOrder_ = order;
+    writeTrackMemory();   // 独立小文件，原子写；不再触碰 app 配置
 }
 
 void PlayerViewModel::restoreTrackMemory(const QString &path) {
     if (!mpv_ || path.isEmpty() || !settingsEnabled_) return;
-    const QVariantMap all = settings_.value("trackMem").toMap();
-    const QVariantMap mem = all.value(path).toMap();
+    loadTrackMemory();
+    const QVariantMap mem = trackMem_.value(path).toMap();
     if (mem.isEmpty()) {   // 无记忆 → 自动字幕策略（locale > 英文 > 目录匹配文件 > 不显示）
         autoSelectSubtitle();
         return;
     }
     // 恢复即使用：LRU 顺序前移（头部 = 最近使用）
-    QStringList order = settings_.value("trackMemOrder").toStringList();
+    QStringList order = trackMemOrder_;
     order.removeAll(path);
     order.prepend(path);
-    settings_.setValue("trackMemOrder", order);
-    settings_.sync();
+    trackMemOrder_ = order;
+    writeTrackMemory();
     // 轨道选择（FILE_LOADED 后 track-list 已填充，设置 aid/sid/vid 生效）。
     // 一律 async（2026-08-10 卡死根因）：本函数在主线程（FILE_LOADED
     // 事件处理）执行——同步 set_property 的 mp_dispatch_lock 会等
@@ -2423,6 +2575,11 @@ void PlayerViewModel::playlistClear() {
     // 真正清空 + 停止（idle）；配合"列表变空 → 忘掉 lastPath_"避免点播放复活。
     mpv_->commandAsync({"playlist-clear", nullptr});
     mpv_->commandAsync({"playlist-remove", "0", nullptr});
+    // 列表清空 → 失败标记一并作废（条目已不存在）
+    if (!entryErrors_.isEmpty()) {
+        entryErrors_.clear();
+        refreshPlaylistErrors();
+    }
 }
 
 void PlayerViewModel::screenshot() {
@@ -2672,6 +2829,13 @@ void PlayerViewModel::initTrueHdr() {
               upHdrLumOverride_ ? "user override" : "auto (panel)");
 }
 
+void PlayerViewModel::persistUpHdrParams() {
+    saveSettings("upHdrLuminance", upHdrLuminance_);
+    saveSettings("upHdrSaturation", upHdrSaturation_);
+    saveSettings("upHdrContrast", upHdrContrast_);
+    saveSettings("upHdrMiddleGray", upHdrMiddleGray_);
+}
+
 void PlayerViewModel::setUpHdrEnabled(bool on) {
     if (on && !aiAllowed("truehdr")) return;
     if (upHdrEnabled_ == on) return;
@@ -2705,7 +2869,6 @@ void PlayerViewModel::setUpHdrLuminance(int nits) {
     if (upHdrLuminance_ == nits) return;
     upHdrLuminance_ = nits;
     emit upHdrLuminanceChanged();
-    saveSettings("upHdrLuminance", nits);
     if (!upHdrLumOverride_) return;   // 覆盖关：值只暂存，不生效（也不下发）
     hdr::setUpconvertLuminanceOverride(true, nits);
 }
@@ -2716,7 +2879,6 @@ void PlayerViewModel::setUpHdrSaturation(int v) {
     if (upHdrSaturation_ == v) return;
     upHdrSaturation_ = v;
     emit upHdrSaturationChanged();
-    saveSettings("upHdrSaturation", v);
     pushVf("truehdr", "saturation", std::to_string(v));
 }
 
@@ -2726,7 +2888,6 @@ void PlayerViewModel::setUpHdrContrast(int v) {
     if (upHdrContrast_ == v) return;
     upHdrContrast_ = v;
     emit upHdrContrastChanged();
-    saveSettings("upHdrContrast", v);
     pushVf("truehdr", "contrast", std::to_string(v));
 }
 
@@ -2736,7 +2897,6 @@ void PlayerViewModel::setUpHdrMiddleGray(int v) {
     if (upHdrMiddleGray_ == v) return;
     upHdrMiddleGray_ = v;
     emit upHdrMiddleGrayChanged();
-    saveSettings("upHdrMiddleGray", v);
     pushVf("truehdr", "middle-gray", std::to_string(v));
 }
 
@@ -2904,9 +3064,6 @@ void PlayerViewModel::updateTime(int64_t t, int64_t d) {
     }
 }
 
-void PlayerViewModel::updateVolume(double v) {
-    if (volume_ != v) { volume_ = v; emit volumeChanged(); }
-}
 
 void PlayerViewModel::updateSpeed(double s) {
     if (speed_.load() != s) { speed_.store(s); emit speedChanged(); }
@@ -2989,12 +3146,17 @@ void PlayerViewModel::onFileLoadedFromEventThread() {
     if (!mpv_) return;
     std::string p = mpv_->propertyString("path");
     bool paused = mpv_->propertyFlag("pause");
+    // mpv 可能按 watch_later 恢复"按文件音量"；观察器会把它作为一次正常
+    // 通知送上来（UI 单一写入者），这里只把"下发目标"同步过去。
+    const double loadedVolume = mpv_->propertyDouble("volume") / 100.0;
     int64_t drops = mpv_->propertyInt64("frame-drop-count");
     // 直播/线性流：不可 seek 或仅部分可 seek → resume 无意义（见 isLiveSource）
     const bool linear = !mpv_->propertyFlag("seekable")
                      || mpv_->propertyFlag("partially-seekable");
-    QMetaObject::invokeMethod(this, [this, p, paused, drops, linear] {
+    QMetaObject::invokeMethod(this, [this, p, paused, drops, linear, loadedVolume] {
         setFileLoaded(true);
+        if (loadedVolume >= 0.0 && loadedVolume <= 1.0)
+            requestedVolume_ = loadedVolume;
         idlePlayIndex_ = -1;   // 已有活动文件 → idle 的"待载入索引"作废
         // 按文件记忆：即时落盘保证旧文件状态已随动作写盘，无需在此保存。
         // external 轨随文件切换被 mpv 清除——pending 待确认列表作废
@@ -3002,6 +3164,9 @@ void PlayerViewModel::onFileLoadedFromEventThread() {
         pendingSubs_.clear();
         if (!p.empty())
             lastPath_ = QString::fromStdString(p);
+        // 这次载入成功 → 该条目先前的失败标记作废（mpv 的状态变了）
+        if (!lastPath_.isEmpty() && entryErrors_.remove(lastPath_))
+            refreshPlaylistErrors();
         // 每次加载完成重新同步 playing = !pause。path 在曲目切换时
         // 会临时清空（误触发 updatePlaying(false)），而 pause 值未变
         // 时 mpv 不通知——此回调保证 UI 状态必然收敛到真实值。
@@ -3289,21 +3454,17 @@ QImage PlayerViewModel::previewImage() const {
 // ── 播放阶段（用户 2026-11-15）────────────────────────────────────
 // 只服务 UI 的空状态区：opening = "正在打开…"、failed = "无法播放"。
 // 事件（FILE_LOADED / END_FILE）都在观察器/事件线程里，写入一律排队到 GUI 线程。
-void PlayerViewModel::setMediaPhase(int phase, const QString &detail) {
-    if (mediaPhase_ == phase && mediaPhaseDetail_ == detail)
+void PlayerViewModel::setMediaPhase(int phase, const QString &detail,
+                                    bool isFolder) {
+    if (mediaPhase_ == phase && mediaPhaseDetail_ == detail &&
+        mediaPhaseIsFolder_ == isFolder)
         return;
     mediaPhase_ = phase;
     mediaPhaseDetail_ = detail;
+    mediaPhaseIsFolder_ = isFolder;
     emit mediaPhaseChanged();
 }
 
-void PlayerViewModel::noteFileLoaded() {
-    // 每个文件载入完成都置 playing（`setFileLoaded` 有去重，切文件时不会触发）。
-    // 但**没有活动文件**时的事件要忽略：启动恢复列表（loadlist … append）
-    // 也会来 FILE_LOADED，那时应该保持 idle 引导（实测否则会显示成播放态）。
-    if (!fileLoaded_) return;
-    setMediaPhase(2);
-}
 
 bool PlayerViewModel::canRetryOpen() const {
     return mediaPhase_ == 3 && pendingOpenIsNetwork_ && !pendingOpenPath_.isEmpty();
@@ -3348,15 +3509,54 @@ void PlayerViewModel::logEndFile(int reason, int error) {
     mpv_free(path);
 }
 
-void PlayerViewModel::noteLoadFailed() {
-    // 已经在 failed 就不重复（mpv 可能连发多个错误）。
-    if (mediaPhase_ == 3) return;
-    const QString why = pendingOpenIsNetwork_
-        ? tr("Could not open the stream") : tr("Could not open the file");
-    setMediaPhase(3, why);
-    // 失败时把画面置黑：否则错误卡片后面还停在上一段的最后一帧，
-    // 看起来像"还在播"（与 clear/stop 同一条置黑路径）。
-    emit playlistEmptied();
+QString PlayerViewModel::loadErrorText(int code) const {
+    // mpv 的错误码是"事实"，但显示文本必须是我们自己的（要进 i18n）。
+    // 只覆盖载入阶段实际可能出现的码；其余归到通用文案。
+    switch (code) {
+    case MPV_ERROR_UNKNOWN_FORMAT:    return tr("Unrecognized format");
+    case MPV_ERROR_NOTHING_TO_PLAY:   return tr("Nothing to play");
+    case MPV_ERROR_LOADING_FAILED:    return tr("Could not load the file");
+    case MPV_ERROR_UNSUPPORTED:       return tr("Not supported");
+    case MPV_ERROR_AO_INIT_FAILED:    return tr("Audio output failed to start");
+    case MPV_ERROR_VO_INIT_FAILED:    return tr("Video output failed to start");
+    case MPV_ERROR_INVALID_PARAMETER: return tr("Invalid request");
+    case MPV_ERROR_NOT_IMPLEMENTED:   return tr("Not implemented");
+    case MPV_ERROR_NOMEM:             return tr("Out of memory");
+    default:
+        return pendingOpenIsNetwork_ ? tr("Could not open the stream")
+                                     : tr("Could not open the file");
+    }
+}
+
+void PlayerViewModel::noteLoadFailed(qint64 entryId, int error) {
+    // mpv 的事实：这个条目载入失败（end-file reason=error，错误码见 error）。
+    // 客户端只做两件事——把错误码挂到该条目上；单条目时把它显示出来。
+    const QString path = entryPathById_.value(entryId);
+    const bool isDir = !path.isEmpty() && QFileInfo(path).isDir();
+    if (!path.isEmpty())
+        entryErrors_.insert(path, error);
+
+    // 单条目（打开单个文件/文件夹，没有列表可参考）→ 才弹错误卡。
+    // 多条目时 mpv 会继续；是否停下由 mpv 自己决定（全失败时它会 idle），
+    // 我们只在列表里给该条目打标，不打断播放。
+    if (playlistCount_ <= 1) {
+        // 目录 + "无法识别格式" = 空文件夹：文案用它自己的说法，
+        // 而不是把 mpv 的 "unrecognized file format" 当成播放错误展示。
+        const bool emptyFolder = isDir && error == MPV_ERROR_UNKNOWN_FORMAT;
+        setMediaPhase(3, emptyFolder ? QString() : loadErrorText(error),
+                      emptyFolder);
+        // 失败时把画面置黑：否则错误卡片后面还停在上一段的最后一帧。
+        emit playlistEmptied();
+    } else {
+        refreshPlaylistErrors();
+    }
+}
+
+void PlayerViewModel::refreshPlaylistErrors() {
+    QVector<int> errs(playlistModel_.count(), 0);
+    for (int i = 0; i < playlistModel_.count(); i++)
+        errs[i] = entryErrors_.value(playlistModel_.pathAt(i), 0);
+    playlistModel_.setErrors(errs);
 }
 
 bool PlayerViewModel::previewUnavailable() const {
