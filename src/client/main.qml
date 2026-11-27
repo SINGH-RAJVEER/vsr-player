@@ -101,12 +101,17 @@ Item {
         // 写回初始值；onChanged 只在翻转时触发），鼠标不在热区则初始
         // 隐藏。弹窗注册表化：新增弹窗只需在 Component.onCompleted 的
         // _popups 数组中登记一行。
-        // Hide the chrome while a disc menu is on screen: our control bar and seek bar
-        // would sit on top of the disc's menu picture (interaction model agreed
-        // 2026-11-26). Popups such as the context menu are not chrome and stay usable.
-        property bool showUi: !viewModel.discMenuActive
-                              && (bottomBar.mouseInRegion || topBar.mouseInRegion
-                                  || anyPopupOpen)
+        // Disc menus are the one case where the chrome must not sit on top of the
+        // picture: the menu *is* the content, its buttons live all over the frame and
+        // the bars would cover them (and eat their clicks). Compromise: while a menu
+        // is on screen and playback is running, keep the chrome out of the way
+        // entirely; as soon as playback is paused, behave like normal playback again
+        // (bars on hover, centre play button) so the user can drive the player.
+        // Pausing is reachable while the chrome is hidden -- Space is routed to the
+        // player, not to the disc.
+        property bool showUi: (bottomBar.mouseInRegion || topBar.mouseInRegion
+                               || anyPopupOpen)
+                              && !(viewModel.discMenuActive && viewModel.playing)
         onShowUiChanged: viewModel.overlaysVisible = showUi
         property var _popups: []
         readonly property bool anyPopupOpen: {
@@ -146,25 +151,6 @@ Item {
             }
         }
 
-        // ── Top Bar ────────────────────────────────────────────────
-        TopBar {
-            id: topBar
-            anchors { left: parent.left; right: parent.right; top: parent.top }
-            videoInfo: viewModel.videoInfo
-            overlaysVisible: viewModel.overlaysVisible
-        }
-
-        // ── Center Play Button ─────────────────────────────────────
-        CenterPlayBtn {
-            anchors.fill: parent
-            playing: viewModel.playing
-            overlaysVisible: viewModel.overlaysVisible
-            // 无媒体时由 IdleScreen 接管中央区域（它的「继续上次播放」就是
-            // 同一个动作），否则两个东西会叠在一起。
-            visible: viewModel.hasMedia
-            onClicked: viewModel.togglePlayPause()
-        }
-
         // ── Mouse forwarding for disc menus (Blu-ray HDMV / BD-J, DVD) ──
         // The menu picture is an OSD bitmap mpv draws into the video frame
         // (player/discnav.c -> OSDTYPE_DISC_MENU); the disc does its own hit testing and
@@ -172,7 +158,8 @@ Item {
         // (0..1, 0,0 top-left): the video fills the window (letterboxing is baked into
         // the frame by mpv), so normalized window coordinates are picture coordinates.
         // Only present while a menu is on screen -- otherwise it would steal
-        // "click to play/pause".
+        // "click to play/pause". Declared *before* the bars so the chrome stays
+        // reachable on top of it (the disc menu keeps every other pixel).
         MouseArea {
             id: discNavArea
             anchors.fill: parent
@@ -189,6 +176,27 @@ Item {
             }
         }
 
+        // ── Top Bar ────────────────────────────────────────────────
+        TopBar {
+            id: topBar
+            anchors { left: parent.left; right: parent.right; top: parent.top }
+            videoInfo: viewModel.videoInfo
+            overlaysVisible: viewModel.overlaysVisible
+        }
+
+        // ── Center Play Button ─────────────────────────────────────
+        CenterPlayBtn {
+            anchors.fill: parent
+            playing: viewModel.playing
+            overlaysVisible: viewModel.overlaysVisible
+            // Without media the IdleScreen owns the centre (its "continue last
+            // playback" row is the same action), otherwise the two overlap. In a 3D
+            // session the video lives on the glasses screen and the control window
+            // puts the glasses hint in the centre, so the button would overlap that.
+            visible: viewModel.hasMedia && !controlMode
+            onClicked: viewModel.togglePlayPause()
+        }
+
         // ── 无媒体：dropzone + 初始操作提示（用户 2026-11-15）────────
         // 真正的拖放落点仍是窗口级 DropArea（这里只做视觉引导 + 快捷入口）。
         IdleScreen {
@@ -197,7 +205,10 @@ Item {
             // 任何 popup（含右键菜单）打开时让位：它是"空状态引导"，
             // 菜单盖上来时还透出面板文字会显脏（菜单是半透明的）。
             // 播放态（mediaPhase 2）整体让位；1=正在打开、3=无法播放 也走这张卡
+            // In a 3D session the centre belongs to the glasses hint below: the card
+            // would be drawn under it and the two would overlap.
             visible: viewModel.mediaPhase !== 2 && !benchmarkMode && !uiLayer.anyPopupOpen
+                     && !controlMode
             dragActive: dropArea.containsDrag
             phase: viewModel.mediaPhase
             detail: viewModel.mediaPhaseDetail
